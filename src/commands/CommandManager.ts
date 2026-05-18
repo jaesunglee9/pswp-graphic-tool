@@ -25,6 +25,12 @@ export class CommandManager {
       this.undoStack.push(command);
     }
   }
+
+  /** Empties the undo and redo stacks. Call when loading a new document. */
+  clear() {
+    this.undoStack = [];
+    this.redoStack = [];
+  }
 }
 
 export const commandManager = new CommandManager();

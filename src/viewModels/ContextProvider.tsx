@@ -1,4 +1,4 @@
-import { PropsWithChildren, useEffect, useRef, useState } from 'react';
+import { PropsWithChildren, useContext, useEffect, useRef, useState } from 'react';
 import {
   ControllerContext,
   ControllerContextInterface,
@@ -21,10 +21,12 @@ import {
   UngroupCommand,
 } from '@/commands/Command';
 import { model } from '@/models/GraphicEditorModel';
+import { SessionContext } from '@/session/SessionContext';
 
 const DEBOUNCE_TIME = 500;
 
 const ContextProvider = ({ children }: PropsWithChildren) => {
+  const { broadcast } = useContext(SessionContext);
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
   const debounceRef = useRef<{
     timer: number;
@@ -47,12 +49,16 @@ const ContextProvider = ({ children }: PropsWithChildren) => {
       cmd
     ) as unknown as GraphicObjectInterface;
     setSelectedIds([addedObject.id]);
+    broadcast('object_add', addedObject);
   };
 
   const remove = () => {
-    const cmd = new RemoveCommand(selectedIds);
+    if (selectedIds.length === 0) return;
+    const ids = [...selectedIds];
+    const cmd = new RemoveCommand(ids);
     commandManager.executeCommand(cmd);
     clearSelect();
+    broadcast('object_remove', ids);
   };
 
   const update = (patch: Partial<GraphicObjectInterface>) => {
@@ -66,6 +72,7 @@ const ContextProvider = ({ children }: PropsWithChildren) => {
     }
 
     model.update(selectedIds, patch);
+    broadcast('object_update', { ids: selectedIds, patch });
 
     debounceRef.current = {
       timer: setTimeout(() => {
@@ -87,6 +94,7 @@ const ContextProvider = ({ children }: PropsWithChildren) => {
     }
 
     model.move(selectedIds, diff);
+    broadcast('object_move', { ids: selectedIds, diff });
 
     debounceRef.current = {
       timer: setTimeout(() => {
@@ -102,10 +110,15 @@ const ContextProvider = ({ children }: PropsWithChildren) => {
     setSelectedIds(prev => (prev.includes(id) ? prev : [...prev, id]));
   const clearSelect = () => setSelectedIds([]);
 
+  /** Sends a full-state snapshot. Used for ops that don't map cleanly to a
+   *  single message type (group/ungroup/reorder/clear). */
+  const broadcastFullState = () => broadcast('full_state', model.snapshot);
+
   const clear = () => {
     clearSelect();
     const cmd = new RemoveAllCommand();
     commandManager.executeCommand(cmd);
+    broadcastFullState();
   };
 
   const group = () => {
@@ -115,6 +128,7 @@ const ContextProvider = ({ children }: PropsWithChildren) => {
     ) as unknown as GroupInterface;
     if (newGroup) {
       setSelectedIds([newGroup.id]);
+      broadcastFullState();
     }
   };
 
@@ -125,16 +139,24 @@ const ContextProvider = ({ children }: PropsWithChildren) => {
     ) as unknown as GraphicObjectInterface[];
     if (ungroupedChildren) {
       setSelectedIds(ungroupedChildren.map(c => c.id));
+      broadcastFullState();
     }
   };
 
   const reorderLayers = (id: string, idx: number) => {
     const cmd = new ReorderLayersCommand(id, idx);
     commandManager.executeCommand(cmd);
+    broadcastFullState();
   };
 
-  const undo = () => commandManager.undo();
-  const redo = () => commandManager.redo();
+  const undo = () => {
+    commandManager.undo();
+    broadcastFullState();
+  };
+  const redo = () => {
+    commandManager.redo();
+    broadcastFullState();
+  };
 
   const controller: ControllerContextInterface = {
     add,

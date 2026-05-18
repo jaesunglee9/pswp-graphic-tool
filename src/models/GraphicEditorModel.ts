@@ -23,6 +23,17 @@ export default class GraphicEditorModel extends Observable {
     return obj;
   }
 
+  /**
+   * Inserts a fully-formed object (with id) at the top of the layer stack.
+   * Used by remote collaboration to mirror peer-created objects without
+   * re-running the local factory (which would assign a new id).
+   */
+  insertObject(obj: GraphicObjectInterface) {
+    if (this.objects.some(o => o.id === obj.id)) return;
+    this.objects.unshift(obj);
+    this.notify();
+  }
+
   remove(ids: string[]) {
     if (ids.length === 0) return;
     this.objects = this.objects.filter(o => !ids.includes(o.id));

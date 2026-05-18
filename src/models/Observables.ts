@@ -1,6 +1,6 @@
 export type Listen = () => void;
 
-export abstract class Observable {
+export class Observable {
   listeners = new Set<Listen>();
 
   subscribe(l: Listen) {
