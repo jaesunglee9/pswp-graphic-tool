@@ -3,7 +3,7 @@
  *
  * Uses vi.stubGlobal with a proper constructor mock.
  */
-import { CollaborationClient, CollaborationMessage } from '@/collaboration/CollaborationClient';
+import { CollaborationClient } from '@/collaboration/CollaborationClient';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
 interface MockWS {
@@ -11,11 +11,11 @@ interface MockWS {
   readyState: number;
   onopen: (() => void) | null;
   onclose: ((e: unknown) => void) | null;
-  onmessage: ((e: { data: string }) => void) | null;
+  onmessage: ((e: { data: any }) => void) | null;
   onerror: ((e: unknown) => void) | null;
   closeCalled: boolean;
-  sentMessages: string[];
-  send: (data: string) => void;
+  sentMessages: any[];
+  send: (data: any) => void;
   close: () => void;
 }
 
@@ -38,7 +38,7 @@ describe('CollaborationClient', () => {
       onerror: null,
       closeCalled: false,
       sentMessages: [],
-      send(data: string) {
+      send(data: any) {
         ws.sentMessages.push(data);
       },
       close() {
@@ -103,23 +103,23 @@ describe('CollaborationClient', () => {
     client.disconnect();
   });
 
-  it('sends a message as JSON', () => {
+  it('sends a raw binary update', () => {
     const client = new CollaborationClient('test-doc-uuid');
     client.connect();
     fireOpen(mockInstances[0]);
-    client.send('object_update', { id: 'obj-1', patch: { color: 'red' } });
+    
+    const testBytes = new Uint8Array([1, 2, 3, 4]);
+    client.send(testBytes);
+    
     expect(mockInstances[0].sentMessages).toHaveLength(1);
-    const parsed = JSON.parse(mockInstances[0].sentMessages[0]);
-    expect(parsed.type).toBe('object_update');
-    expect(parsed.data.id).toBe('obj-1');
-    expect(parsed.timestamp).toBeDefined();
+    expect(mockInstances[0].sentMessages[0]).toEqual(testBytes);
     client.disconnect();
   });
 
   it('warns when sending while not connected', () => {
     const client = new CollaborationClient('test-doc-uuid');
     const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
-    client.send('object_add', {});
+    client.send(new Uint8Array([0, 1, 2]));
     expect(warnSpy).toHaveBeenCalled();
     warnSpy.mockRestore();
   });
@@ -131,11 +131,11 @@ describe('CollaborationClient', () => {
     client.connect();
     fireOpen(mockInstances[0]);
 
-    const msg: CollaborationMessage = { type: 'full_state', data: [], timestamp: Date.now() };
-    mockInstances[0].onmessage?.({ data: JSON.stringify(msg) });
+    const testArray = new Uint8Array([5, 6, 7, 8]);
+    mockInstances[0].onmessage?.({ data: testArray.buffer } as any);
 
     expect(handler).toHaveBeenCalledTimes(1);
-    expect(handler).toHaveBeenCalledWith(expect.objectContaining({ type: 'full_state' }));
+    expect(handler).toHaveBeenCalledWith(testArray);
     client.disconnect();
   });
 
@@ -147,7 +147,9 @@ describe('CollaborationClient', () => {
 
     client.connect();
     fireOpen(mockInstances[0]);
-    mockInstances[0].onmessage?.({ data: JSON.stringify({ type: 'full_state', data: [] }) });
+    
+    const testArray = new Uint8Array([5, 6, 7, 8]);
+    mockInstances[0].onmessage?.({ data: testArray.buffer } as any);
 
     expect(handler).not.toHaveBeenCalled();
     client.disconnect();

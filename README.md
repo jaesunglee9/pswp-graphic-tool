@@ -112,7 +112,11 @@ pswp-graphic-tool/
 │       └── resources/
 │           └── application.yml                   # Spring config
 │
-├── src/                              # TypeScript React frontend
+├── frontend/                         # TypeScript React frontend (Vite)
+│   ├── package.json                  # Frontend deps and scripts
+│   ├── vite.config.ts                # Vite + Vitest config
+│   ├── index.html
+│   └── src/
 │   ├── api/                          # HTTP client layer
 │   │   ├── client.ts                 # Generic fetch wrapper
 │   │   └── documentApi.ts            # Typed document CRUD
@@ -167,31 +171,51 @@ pswp-graphic-tool/
 
 ## Quick Start
 
-### Backend
+The repo has two halves as sibling directories: `frontend/` (React + Vite) and
+`backend/` (Spring Boot). The root holds only docs and a thin script wrapper.
 
-**Prerequisites:** Java 21+, Maven 3.9+
+**Prerequisites:** Node.js 20+, npm, Java 21+, Maven 3.9+
+
+### Both halves, one command
 
 ```bash
-cd backend
-mvn spring-boot:run
+git clone <repo> && cd pswp-graphic-tool
+npm install                  # root: installs concurrently
+npm install --prefix frontend
+npm run dev:all              # starts Vite and Spring Boot together
 ```
 
-The server starts at `http://localhost:8080`.
-H2 console available at `http://localhost:8080/h2-console`.
-
-### Frontend
-
-**Prerequisites:** Node.js 20+, npm
+### Or run them separately
 
 ```bash
-# Install dependencies
-npm install
+# Terminal 1 — backend
+cd backend
+mvn spring-boot:run
 
-# Start Vite dev server
+# Terminal 2 — frontend (from the repo root)
+npm install --prefix frontend
 npm run dev
 ```
 
-The app runs at `http://localhost:5173`.
+The backend starts at `http://localhost:8080` (H2 console at `/h2-console`).
+The frontend runs at `http://localhost:5173/pswp-graphic-tool/` — note the
+path prefix, which comes from `base` in `frontend/vite.config.ts`.
+
+### Root scripts
+
+| Command | What it does |
+|---|---|
+| `npm run dev:all` | Vite + Spring Boot together |
+| `npm run dev` | frontend only |
+| `npm run dev:api` | backend only |
+| `npm test` | frontend tests (vitest) |
+| `npm run test:api` | backend tests (maven) |
+| `npm run test:all` | both |
+| `npm run lint` | eslint over the frontend |
+
+> **Collaboration does not work yet.** The client sends binary WebSocket frames
+> while the backend still extends `TextWebSocketHandler`, which rejects them with
+> close code 1003. See PLAN.md.
 
 With no backend running, the app still works in **local-only** mode — the
 DocumentBar shows "Local only" and edits are kept in memory. As soon as
@@ -380,8 +404,8 @@ This prevents hundreds of tiny undo steps from a single drag.
 ### Tests
 
 ```bash
-npm test            # one-off run (CI mode)
-npm run test:watch  # watch mode
+npm test                                  # from the repo root
+npm --prefix frontend run test:watch      # watch mode
 ```
 
 The suite covers models, commands, hooks, utilities, the API client,

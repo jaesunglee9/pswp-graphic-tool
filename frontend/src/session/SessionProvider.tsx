@@ -12,11 +12,7 @@ import {
   SessionStatus,
   OpenDocument,
 } from '@/session/SessionContext';
-import applyRemoteMessage from '@/session/applyRemoteMessage';
-import {
-  CollaborationClient,
-  CollaborationMessageType,
-} from '@/collaboration/CollaborationClient';
+import { CollaborationClient } from '@/collaboration/CollaborationClient';
 import {
   DocumentSummary,
   createDocument,
@@ -45,11 +41,16 @@ const SessionProvider = ({ children }: PropsWithChildren) => {
   const [error, setError] = useState<string | null>(null);
   const [isConnected, setIsConnected] = useState(false);
   const collabRef = useRef<CollaborationClient | null>(null);
+  const modelUnsubRef = useRef<(() => void) | null>(null);
 
   const teardownCollab = useCallback(() => {
     if (collabRef.current) {
       collabRef.current.disconnect();
       collabRef.current = null;
+    }
+    if (modelUnsubRef.current) {
+      modelUnsubRef.current();
+      modelUnsubRef.current = null;
     }
     setIsConnected(false);
   }, []);
@@ -86,8 +87,22 @@ const SessionProvider = ({ children }: PropsWithChildren) => {
     const client = new CollaborationClient(documentId);
     collabRef.current = client;
 
-    client.onMessage(msg => {
-      applyRemoteMessage(msg);
+    client.onMessage(uint8 => {
+      if (uint8.length < 1) return;
+      const msgType = uint8[0];
+      const payload = uint8.subarray(1);
+
+      if (msgType === 0) {
+        model.applyRemoteUpdate(payload);
+      }
+    });
+
+    // Capture and package outbound local model updates
+    modelUnsubRef.current = model.onLocalUpdate((update) => {
+      const packet = new Uint8Array(1 + update.length);
+      packet[0] = 0; // Header byte: 0 = Yjs Document Sync
+      packet.set(update, 1);
+      client.send(packet);
     });
 
     // Best-effort liveness signal. We can't subscribe to the underlying
@@ -177,8 +192,10 @@ const SessionProvider = ({ children }: PropsWithChildren) => {
   );
 
   const broadcast = useCallback(
-    (type: CollaborationMessageType, data: unknown) => {
-      collabRef.current?.send(type, data);
+    () => {
+      // No-op: sync is handled by the model's Yjs local-update listener.
+      // TODO(ship-review): delete broadcast() and its 13 call sites entirely --
+      // see PLAN.md decision log, cleanup step 12.
     },
     []
   );

@@ -43,7 +43,7 @@ export interface CollaborationMessage {
   timestamp?: number;
 }
 
-type MessageHandler = (message: CollaborationMessage) => void;
+type MessageHandler = (update: Uint8Array) => void;
 
 const WS_BASE_URL = 'ws://localhost:8080/api/collaboration';
 
@@ -66,6 +66,7 @@ export class CollaborationClient {
 
     const url = `${WS_BASE_URL}/${this.documentId}`;
     this.ws = new WebSocket(url);
+    this.ws.binaryType = 'arraybuffer';
 
     this.ws.onopen = () => {
       console.log(`[Collab] Connected to document ${this.documentId}`);
@@ -74,8 +75,10 @@ export class CollaborationClient {
 
     this.ws.onmessage = (event: MessageEvent) => {
       try {
-        const message: CollaborationMessage = JSON.parse(event.data);
-        this.handlers.forEach((handler) => handler(message));
+        if (event.data instanceof ArrayBuffer) {
+          const update = new Uint8Array(event.data);
+          this.handlers.forEach((handler) => handler(update));
+        }
       } catch (err) {
         console.error('[Collab] Failed to parse message:', err);
       }
@@ -103,20 +106,14 @@ export class CollaborationClient {
     this.ws = null;
   }
 
-  /** Send a message to all other clients in the room. */
-  send(type: CollaborationMessageType, data: unknown): void {
+  /** Send a raw binary update to all other clients in the room. */
+  send(update: Uint8Array): void {
     if (this.ws?.readyState !== WebSocket.OPEN) {
       console.warn('[Collab] Cannot send — not connected');
       return;
     }
 
-    const message: CollaborationMessage = {
-      type,
-      data,
-      timestamp: Date.now(),
-    };
-
-    this.ws.send(JSON.stringify(message));
+    this.ws.send(update);
   }
 
   /** Register a handler for incoming messages. */
