@@ -45,8 +45,17 @@ collaboration is not functional yet** — see Known Broken below.
   converge, so a snapshot-equality test passes on the corrupt document.
 - **No document persistence across peers.** Each client seeds its `Y.Doc` from
   the stored JSON independently, which duplicates every shape on merge.
+- **4 of 22 backend tests fail**, and have since the backend was added
+  (2026-05-18). `NoSuchElementException` escapes as HTTP 500 where the tests
+  expect 404, because no `@RestControllerAdvice` exists:
+  `DocumentControllerTest.getDocument_Returns404_WhenNotFound`,
+  `.updateDocument_Returns404_WhenNotFound`,
+  `.deleteDocument_Returns404_WhenNotFound`, and
+  `DocumentIntegrationTest.fullCrudLifecycle`.
 - `npm run lint` reports 6 pre-existing `no-explicit-any` errors in the
   `CollaborationClient` test WebSocket mock.
+- `mvn -o test` cannot resolve the surefire plugin offline even with a warm
+  `~/.m2`; the backend needs network on a cold run.
 - No CI. The 116 frontend tests mock the WebSocket and never deliver an
   `ArrayBuffer`, which is why the outage above went unnoticed.
 

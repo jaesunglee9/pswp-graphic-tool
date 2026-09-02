@@ -39,6 +39,23 @@ never hold a child id. Becomes reachable if selection semantics change.
 
 ## Backend
 
+### Add @RestControllerAdvice so missing documents return 404
+
+**What:** Map `NoSuchElementException` to 404 and `MethodArgumentNotValidException`
+to 400 with field errors. RFC 9457 Problem Details.
+
+**Why:** 4 of 22 backend tests fail on this today and have since the backend
+landed. A missing document returns HTTP 500, and the frontend renders the raw
+Spring error JSON into the status bar.
+
+**Context:** No `@ControllerAdvice` exists in `backend/src/main/java`. Failing:
+`DocumentControllerTest.{get,update,delete}Document_Returns404_WhenNotFound`
+and `DocumentIntegrationTest.fullCrudLifecycle`. ~15 lines fixes all four.
+
+**Effort:** S
+**Priority:** P1
+**Depends on:** None
+
 ### Real auth + per-document ownership
 
 **What:** Authenticate WebSocket and REST callers; scope documents to owners.
