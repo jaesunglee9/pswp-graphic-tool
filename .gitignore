@@ -24,3 +24,9 @@ dist-ssr
 *.sw?
 
 .env
+
+# Maven build output
+backend/target/
+# Personal notes and agent-harness config (kept local, not versioned)
+_zettel/
+.pi/
