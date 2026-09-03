@@ -51,6 +51,7 @@ export class CollaborationClient {
   private ws: WebSocket | null = null;
   private documentId: string;
   private handlers: Set<MessageHandler> = new Set();
+  private openHandlers: Set<() => void> = new Set();
   private reconnectAttempts = 0;
   private maxReconnectAttempts = 5;
   private reconnectDelay = 2000;
@@ -71,6 +72,10 @@ export class CollaborationClient {
     this.ws.onopen = () => {
       console.log(`[Collab] Connected to document ${this.documentId}`);
       this.reconnectAttempts = 0;
+      // Fires on every connect, including reconnects. Subscribers use this to
+      // send their full document state so peers converge without a server-side
+      // replica. Wiring this at the call site instead would only ever run once.
+      this.openHandlers.forEach(h => h());
     };
 
     this.ws.onmessage = (event: MessageEvent) => {
@@ -84,8 +89,11 @@ export class CollaborationClient {
       }
     };
 
-    this.ws.onclose = () => {
-      console.log('[Collab] Disconnected');
+    this.ws.onclose = (event: CloseEvent) => {
+      console.log(
+        `[Collab] Disconnected (code=${event.code}` +
+          (event.reason ? ` reason="${event.reason}"` : '') + ')'
+      );
       if (this.shouldReconnect && this.reconnectAttempts < this.maxReconnectAttempts) {
         this.reconnectAttempts++;
         console.log(`[Collab] Reconnecting (attempt ${this.reconnectAttempts}/${this.maxReconnectAttempts})...`);
@@ -114,6 +122,12 @@ export class CollaborationClient {
     }
 
     this.ws.send(update);
+  }
+
+  /** Register a handler that fires on every successful connect. */
+  onOpen(handler: () => void): () => void {
+    this.openHandlers.add(handler);
+    return () => this.openHandlers.delete(handler);
   }
 
   /** Register a handler for incoming messages. */

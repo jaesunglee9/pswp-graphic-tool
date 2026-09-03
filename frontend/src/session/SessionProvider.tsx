@@ -34,6 +34,20 @@ import { commandManager } from '@/commands/CommandManager';
  * `isConnected` does), and keeping it stable lets the controller layer
  * call `broadcast` from anywhere without dependency churn.
  */
+/** Yjs updates are binary; the documents.content column is TEXT. */
+const bytesToBase64 = (bytes: Uint8Array): string => {
+  let binary = '';
+  for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+  return btoa(binary);
+};
+
+const base64ToBytes = (value: string): Uint8Array => {
+  const binary = atob(value);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return bytes;
+};
+
 const SessionProvider = ({ children }: PropsWithChildren) => {
   const [current, setCurrent] = useState<OpenDocument | null>(null);
   const [documents, setDocuments] = useState<DocumentSummary[]>([]);
@@ -42,6 +56,7 @@ const SessionProvider = ({ children }: PropsWithChildren) => {
   const [isConnected, setIsConnected] = useState(false);
   const collabRef = useRef<CollaborationClient | null>(null);
   const modelUnsubRef = useRef<(() => void) | null>(null);
+  const openUnsubRef = useRef<(() => void) | null>(null);
 
   const teardownCollab = useCallback(() => {
     if (collabRef.current) {
@@ -51,6 +66,10 @@ const SessionProvider = ({ children }: PropsWithChildren) => {
     if (modelUnsubRef.current) {
       modelUnsubRef.current();
       modelUnsubRef.current = null;
+    }
+    if (openUnsubRef.current) {
+      openUnsubRef.current();
+      openUnsubRef.current = null;
     }
     setIsConnected(false);
   }, []);
@@ -68,16 +87,44 @@ const SessionProvider = ({ children }: PropsWithChildren) => {
     }
   }, []);
 
-  /** Replaces local state with the given content, clearing undo history. */
-  const loadContentIntoModel = (contentJson: string) => {
-    let parsed: GraphicObjectInterface[];
-    try {
-      parsed = contentJson ? JSON.parse(contentJson) : [];
-      if (!Array.isArray(parsed)) parsed = [];
-    } catch {
-      parsed = [];
+  /**
+   * Loads stored document content into the model.
+   *
+   * Content is a base64-encoded Yjs update, NOT JSON. This matters: seeding two
+   * clients from a JSON snapshot makes each one build its own Y.Map objects, so
+   * the two replicas share no CRDT identity and merging them duplicates every
+   * shape (verified: two docs seeded from ['x','y'] merge to
+   * ["x","y","x","y"]). Applying the same update bytes is idempotent instead,
+   * so every client converges on one document.
+   *
+   * Legacy JSON content is still read, once, so documents created before this
+   * change still open. The next save rewrites them as binary.
+   */
+  const loadContentIntoModel = (content: string) => {
+    if (!content) {
+      commandManager.clear();
+      return;
     }
-    model.restore(parsed);
+
+    if (content.trimStart().startsWith('[')) {
+      // Legacy JSON snapshot. Safe here only because the model is empty.
+      let parsed: GraphicObjectInterface[];
+      try {
+        parsed = JSON.parse(content);
+        if (!Array.isArray(parsed)) parsed = [];
+      } catch {
+        parsed = [];
+      }
+      model.restore(parsed);
+      commandManager.clear();
+      return;
+    }
+
+    try {
+      model.applyRemoteUpdate(base64ToBytes(content));
+    } catch (err) {
+      console.error('[Session] Could not apply stored document state:', err);
+    }
     commandManager.clear();
   };
 
@@ -87,6 +134,13 @@ const SessionProvider = ({ children }: PropsWithChildren) => {
     const client = new CollaborationClient(documentId);
     collabRef.current = client;
 
+    const sendSync = (update: Uint8Array) => {
+      const packet = new Uint8Array(1 + update.length);
+      packet[0] = 0; // envelope: 0 = Yjs document sync
+      packet.set(update, 1);
+      client.send(packet);
+    };
+
     client.onMessage(uint8 => {
       if (uint8.length < 1) return;
       const msgType = uint8[0];
@@ -94,16 +148,27 @@ const SessionProvider = ({ children }: PropsWithChildren) => {
 
       if (msgType === 0) {
         model.applyRemoteUpdate(payload);
+      } else if (msgType === 2) {
+        // A peer just joined and is asking who has state. Answer with ours.
+        // This is the return leg of the handshake: without it a joiner only
+        // ever announces what it has and nobody tells it what it is missing,
+        // so opening a document with existing content shows a blank canvas.
+        sendSync(model.encodeStateAsUpdate());
       }
     });
 
-    // Capture and package outbound local model updates
-    modelUnsubRef.current = model.onLocalUpdate((update) => {
-      const packet = new Uint8Array(1 + update.length);
-      packet[0] = 0; // Header byte: 0 = Yjs Document Sync
-      packet.set(update, 1);
-      client.send(packet);
+    // On every connect (including reconnects) push our whole document state.
+    // The server keeps no replica, so this is what makes a peer converge: each
+    // side hands the other everything it has, and Yjs merges. It is also how a
+    // client that edited while disconnected gets its work back into the room --
+    // send() silently drops frames while the socket is closed.
+    openUnsubRef.current = client.onOpen(() => {
+      sendSync(model.encodeStateAsUpdate());
+      client.send(new Uint8Array([2])); // ask peers for theirs
     });
+
+    // Capture and package outbound local model updates
+    modelUnsubRef.current = model.onLocalUpdate(sendSync);
 
     // Best-effort liveness signal. We can't subscribe to the underlying
     // `ws.onopen` from outside the class, so poll once shortly after.
@@ -145,8 +210,7 @@ const SessionProvider = ({ children }: PropsWithChildren) => {
     setStatus('loading');
     setError(null);
     try {
-      const snapshot = model.snapshot;
-      const content = JSON.stringify(snapshot);
+      const content = bytesToBase64(model.encodeStateAsUpdate());
       const doc = await createDocument(title, content);
       setCurrent({ id: doc.id, title: doc.title });
       startCollabSession(doc.id);
@@ -163,7 +227,7 @@ const SessionProvider = ({ children }: PropsWithChildren) => {
     if (!current) return;
     setError(null);
     try {
-      const content = JSON.stringify(model.snapshot);
+      const content = bytesToBase64(model.encodeStateAsUpdate());
       await updateDocument(current.id, { title: current.title, content });
       await refreshDocuments();
     } catch (err) {
