@@ -1,15 +1,34 @@
 /**
  * Yjs-backed graphic model — wraps a Y.Doc for CRDT collaboration.
  *
- * Replaces the plain-array GraphicEditorModel with Yjs shared types:
- *   Y.Array → top-level layer ordering
- *   Y.Map   → each individual graphic object and its properties
- *   Y.Array → group children (nested inside a group's Y.Map)
+ * ## Why the internal shape is flat
  *
- * The public API mirrors GraphicEditorModel so the transition is
- * transparent to views and controllers.
+ * The obvious encoding — a Y.Array of shapes where a group nests its children
+ * in another Y.Array — cannot express "move". Yjs arrays have no move
+ * operation, so reordering or regrouping means deleting the shape's Y.Map and
+ * building a new one. That is not CRDT-safe. Verified on yjs 13.6.31:
+ *
+ *   two peers reorder the same shape  -> the id appears TWICE, on both peers
+ *   recolor concurrent with a reorder -> the recolor lands on the tombstone
+ *                                        and is silently discarded
+ *
+ * Both peers converge, so a snapshot-equality test passes on the corruption.
+ *
+ * So the document is stored FLAT: every shape, at any depth, is one entry in a
+ * single Y.Array, and structure lives in two fields on the shape itself:
+ *
+ *   order    fractional index (string) — position among siblings
+ *   parentId id of the containing group, or null for top level
+ *
+ * Moving a shape is then a single `set()` on a field: last-writer-wins on that
+ * one key, no clone, no tombstone, and concurrent edits to other fields on the
+ * same shape survive untouched.
+ *
+ * `snapshot` rebuilds the nested tree the views expect, so this encoding is
+ * invisible to everything outside this file.
  */
 import * as Y from 'yjs';
+import { generateKeyBetween } from 'fractional-indexing';
 import {
   GraphicObjectInterface,
   GraphicObjectType,
@@ -18,45 +37,47 @@ import {
 import { PositionType } from './types';
 import objectFactory from './ObjectFactory';
 
-/** Recursively walk a Y.Map tree and produce a plain GraphicObjectInterface. */
-function yMapToObject(obj: Y.Map<unknown>): GraphicObjectInterface {
+/** Fields that describe tree structure rather than the shape itself. */
+const ORDER = 'order';
+const PARENT = 'parentId';
+
+/** Marks updates applied from a peer so onLocalUpdate can filter them out. */
+export const REMOTE_ORIGIN = Symbol('remote');
+
+type Row = { map: Y.Map<unknown>; id: string; parentId: string | null; order: string };
+
+/** Plain view of one Y.Map, minus the structural fields. */
+function rowToObject(map: Y.Map<unknown>): Record<string, unknown> {
   const raw: Record<string, unknown> = {};
-  for (const [key, value] of obj.entries()) {
-    if (key === 'children' && value instanceof Y.Array) {
-      raw[key] = value.toArray().map((item: unknown) =>
-        yMapToObject(item as Y.Map<unknown>)
-      );
-    } else {
-      raw[key] = value;
-    }
+  for (const [key, value] of map.entries()) {
+    if (key === ORDER || key === PARENT) continue;
+    raw[key] = value;
   }
-  return raw as unknown as GraphicObjectInterface;
+  return raw;
 }
 
-/** Convert a plain GraphicObjectInterface into a Y.Map. */
-function objectToYMap(plain: GraphicObjectInterface): Y.Map<unknown> {
+function objectToYMap(
+  plain: Record<string, unknown>,
+  parentId: string | null,
+  order: string
+): Y.Map<unknown> {
   const map = new Y.Map<unknown>();
   for (const [key, value] of Object.entries(plain)) {
-    if (key === 'children' && Array.isArray(value)) {
-      const arr = new Y.Array<Y.Map<unknown>>();
-      arr.push(value.map((child: GraphicObjectInterface) => objectToYMap(child)));
-      map.set(key, arr);
-    } else {
-      map.set(key, value);
-    }
+    if (key === 'children') continue; // structure is derived, never stored
+    map.set(key, value);
   }
+  map.set(PARENT, parentId);
+  map.set(ORDER, order);
   return map;
 }
 
-/**
- * Apply a partial update to a Y.Map. Handles nested plain objects
- * (e.g. position, scale) by shallow-merging them.
- */
-function applyPatch(
-  obj: Y.Map<unknown>,
-  patch: Record<string, unknown>,
-): void {
+function isPlainObject(v: unknown): v is Record<string, unknown> {
+  return typeof v === 'object' && v !== null && !Array.isArray(v);
+}
+
+function applyPatch(obj: Y.Map<unknown>, patch: Record<string, unknown>): void {
   for (const [key, value] of Object.entries(patch)) {
+    if (key === 'children') continue;
     if (isPlainObject(value) && isPlainObject(obj.get(key))) {
       obj.set(key, { ...(obj.get(key) as Record<string, unknown>), ...value });
     } else {
@@ -64,60 +85,6 @@ function applyPatch(
     }
   }
 }
-
-function isPlainObject(v: unknown): v is Record<string, unknown> {
-  return typeof v === 'object' && v !== null && !Array.isArray(v);
-}
-
-/** Search for an id in a plain-object tree, returning the root. */
-function searchInSnapshot(
-  searchId: string,
-  node: GraphicObjectInterface,
-): GraphicObjectInterface | null {
-  if (node.id === searchId) return node;
-  if (node.type === 'group') {
-    for (const child of (node as GroupInterface).children) {
-      const found = searchInSnapshot(searchId, child);
-      if (found) return node;
-    }
-  }
-  return null;
-}
-
-/**
- * Recursively walk a Y.Map tree and update positions for matching ids.
- * Counterpart to utils/walk.ts but operating on Yjs shared types.
- */
-function yWalk(
-  obj: Y.Map<unknown>,
-  idSet: Set<string>,
-  diff: PositionType,
-  isParentSelected: boolean,
-): void {
-  const id = obj.get('id') as string;
-  const type = obj.get('type') as string;
-  const isSelected = isParentSelected || idSet.has(id);
-
-  if (type !== 'group') {
-    if (isSelected) {
-      const pos = obj.get('position') as PositionType;
-      obj.set('position', { x: pos.x + diff.x, y: pos.y + diff.y });
-    }
-    return;
-  }
-
-  // Group: recurse into children
-  const children = obj.get('children') as Y.Array<Y.Map<unknown>>;
-  if (children) {
-    for (let i = 0; i < children.length; i++) {
-      yWalk(children.get(i), idSet, diff, isSelected);
-    }
-  }
-}
-
-// ---------------------------------------------------------------------------
-// YjsGraphicModel
-// ---------------------------------------------------------------------------
 
 export class YjsGraphicModel {
   readonly doc: Y.Doc;
@@ -128,182 +95,248 @@ export class YjsGraphicModel {
     this.objects = this.doc.getArray('objects');
   }
 
-  // ---- Public API (mirrors GraphicEditorModel) ----
+  // ---- internal helpers ----
 
-  /** Returns a plain-array snapshot of the current state. */
-  get snapshot(): GraphicObjectInterface[] {
-    return this.objects.toArray().map((item) => yMapToObject(item));
-  }
-
-  /** Create a new object and insert at the top of the layer stack. */
-  add(type: Exclude<GraphicObjectType, 'group'>): GraphicObjectInterface {
-    const plain = objectFactory(type);
-    this.doc.transact(() => {
-      this.objects.insert(0, [objectToYMap(plain)]);
-    });
-    return plain;
-  }
-
-  /**
-   * Insert a fully-formed object (with existing id) at top of layer stack.
-   * Used by remote collaboration to mirror peer-created objects.
-   */
-  insertObject(plain: GraphicObjectInterface): void {
-    // Idempotent: skip if an object with this id already exists
+  private rows(): Row[] {
+    const out: Row[] = [];
     for (let i = 0; i < this.objects.length; i++) {
-      if (this.objects.get(i).get('id') === plain.id) return;
+      const map = this.objects.get(i);
+      const id = map.get('id') as string;
+      if (!id) continue;
+      out.push({
+        map,
+        id,
+        parentId: (map.get(PARENT) as string | null) ?? null,
+        order: (map.get(ORDER) as string) ?? 'a0',
+      });
     }
-    this.doc.transact(() => {
-      this.objects.insert(0, [objectToYMap(plain)]);
+    return out;
+  }
+
+  private byId(id: string): Y.Map<unknown> | undefined {
+    return this.rows().find(r => r.id === id)?.map;
+  }
+
+  /** Siblings under a parent, in display order (top of the stack first). */
+  private siblings(rows: Row[], parentId: string | null): Row[] {
+    return rows
+      .filter(r => r.parentId === parentId)
+      .sort((x, y) => (x.order < y.order ? -1 : x.order > y.order ? 1 : x.id < y.id ? -1 : 1));
+  }
+
+  /** Order key that places a shape above every current sibling. */
+  private orderAtTop(rows: Row[], parentId: string | null): string {
+    const first = this.siblings(rows, parentId)[0];
+    return generateKeyBetween(null, first ? first.order : null);
+  }
+
+  private buildTree(rows: Row[], parentId: string | null): GraphicObjectInterface[] {
+    return this.siblings(rows, parentId).map(row => {
+      const plain = rowToObject(row.map);
+      if (plain.type === 'group') {
+        plain.children = this.buildTree(rows, row.id);
+      }
+      return plain as unknown as GraphicObjectInterface;
     });
   }
 
-  /** Remove objects by their ids. No-op if ids is empty. */
+  private descendantIds(rows: Row[], id: string): string[] {
+    const kids = rows.filter(r => r.parentId === id);
+    return kids.flatMap(k => [k.id, ...this.descendantIds(rows, k.id)]);
+  }
+
+  /** Walks up the parent chain to the outermost ancestor. */
+  private rootOf(rows: Row[], id: string): Row | undefined {
+    let cur = rows.find(r => r.id === id);
+    while (cur?.parentId) {
+      const next = rows.find(r => r.id === cur!.parentId);
+      if (!next) break;
+      cur = next;
+    }
+    return cur;
+  }
+
+  private deleteRows(ids: Set<string>): void {
+    for (let i = this.objects.length - 1; i >= 0; i--) {
+      if (ids.has(this.objects.get(i).get('id') as string)) this.objects.delete(i, 1);
+    }
+  }
+
+  // ---- Public API (unchanged shape) ----
+
+  /** Nested plain-object snapshot, top of the layer stack first. */
+  get snapshot(): GraphicObjectInterface[] {
+    return this.buildTree(this.rows(), null);
+  }
+
+  add(type: Exclude<GraphicObjectType, 'group'>): GraphicObjectInterface {
+    const plain = objectFactory(type) as unknown as Record<string, unknown>;
+    this.doc.transact(() => {
+      const order = this.orderAtTop(this.rows(), null);
+      this.objects.push([objectToYMap(plain, null, order)]);
+    });
+    return plain as unknown as GraphicObjectInterface;
+  }
+
+  /** Insert a fully-formed object. Idempotent at any depth. */
+  insertObject(plain: GraphicObjectInterface): void {
+    if (this.byId(plain.id)) return;
+    this.doc.transact(() => {
+      const order = this.orderAtTop(this.rows(), null);
+      this.objects.push([
+        objectToYMap(plain as unknown as Record<string, unknown>, null, order),
+      ]);
+    });
+  }
+
+  /** Remove objects and everything nested inside them. */
   remove(ids: string[]): void {
     if (ids.length === 0) return;
-    const idSet = new Set(ids);
     this.doc.transact(() => {
-      // Iterate backwards so indices stay valid as we delete
-      for (let i = this.objects.length - 1; i >= 0; i--) {
-        if (idSet.has(this.objects.get(i).get('id') as string)) {
-          this.objects.delete(i, 1);
-        }
+      const rows = this.rows();
+      const doomed = new Set<string>();
+      for (const id of ids) {
+        doomed.add(id);
+        this.descendantIds(rows, id).forEach(d => doomed.add(d));
       }
+      this.deleteRows(doomed);
     });
   }
 
-  /**
-   * Patch properties on matching objects. Supports nested updates
-   * (e.g. { position: { x: 10 } } and { scale: { width: 200 } }).
-   */
+  /** Patch properties on matching objects, at any depth. */
   update(ids: string[], patch: Partial<GraphicObjectInterface>): void {
     if (ids.length === 0) return;
     const idSet = new Set(ids);
     this.doc.transact(() => {
-      for (let i = 0; i < this.objects.length; i++) {
-        const obj = this.objects.get(i);
-        if (idSet.has(obj.get('id') as string)) {
-          applyPatch(obj, patch);
-        }
+      for (const row of this.rows()) {
+        if (idSet.has(row.id)) applyPatch(row.map, patch as Record<string, unknown>);
       }
     });
   }
 
-  /**
-   * Move matching objects (and selected children in groups) by a delta.
-   * Recursively walks into group children.
-   */
+  /** Move objects, and everything inside a selected group, by a delta. */
   move(ids: string[], diff: PositionType): void {
     if (ids.length === 0) return;
-    const idSet = new Set(ids);
     this.doc.transact(() => {
-      for (let i = 0; i < this.objects.length; i++) {
-        yWalk(this.objects.get(i), idSet, diff, false);
+      const rows = this.rows();
+
+      // A selected group moves its whole subtree.
+      const moving = new Set<string>();
+      for (const id of ids) {
+        moving.add(id);
+        this.descendantIds(rows, id).forEach(d => moving.add(d));
+      }
+
+      for (const row of rows) {
+        if (!moving.has(row.id)) continue;
+        // A group has no position of its own; its bounds are derived from its
+        // children, which are in `moving` too and get shifted below.
+        if (row.map.get('type') === 'group') continue;
+        const pos = row.map.get('position') as PositionType | undefined;
+        if (!pos) continue;
+        row.map.set('position', { x: pos.x + diff.x, y: pos.y + diff.y });
       }
     });
   }
 
   /**
-   * Group the given objects (by id) into a new group.
-   * Returns the new group's id, or undefined if fewer than 2 objects.
+   * Group objects. Reparents them by setting parentId — the shapes' Y.Maps are
+   * never recreated, so a concurrent edit to one of them survives.
    */
   group(ids: string[]): GroupInterface | undefined {
     if (ids.length < 2) return undefined;
-    const idSet = new Set(ids);
     const groupId = crypto.randomUUID();
+    let ok = false;
 
-    let newGroup: GroupInterface | undefined;
     this.doc.transact(() => {
-      const children: GraphicObjectInterface[] = [];
-      // Collect and remove matching top-level objects
-      for (let i = this.objects.length - 1; i >= 0; i--) {
-        const obj = this.objects.get(i);
-        if (idSet.has(obj.get('id') as string)) {
-          children.unshift(yMapToObject(obj));
-          this.objects.delete(i, 1);
-        }
+      const rows = this.rows();
+      const members = rows.filter(r => ids.includes(r.id));
+      if (members.length < 2) return;
+
+      const parentId = members[0].parentId;
+      const groupMap = objectToYMap(
+        {
+          id: groupId,
+          title: 'group',
+          type: 'group',
+          color: 'transparent',
+          position: { x: 0, y: 0 },
+          rotation: 0,
+        },
+        parentId,
+        this.orderAtTop(rows, parentId)
+      );
+      this.objects.push([groupMap]);
+
+      // Preserve relative order inside the group.
+      const ordered = members.sort((x, y) => (x.order < y.order ? -1 : 1));
+      let prev: string | null = null;
+      for (const m of ordered) {
+        prev = generateKeyBetween(prev, null);
+        m.map.set(PARENT, groupId);
+        m.map.set(ORDER, prev);
       }
 
-      const groupYMap = new Y.Map<unknown>();
-      const childrenArray = new Y.Array<Y.Map<unknown>>();
-      childrenArray.push(children.map(c => objectToYMap(c)));
-
-      groupYMap.set('id', groupId);
-      groupYMap.set('title', 'group');
-      groupYMap.set('type', 'group');
-      groupYMap.set('color', 'transparent');
-      groupYMap.set('position', { x: 0, y: 0 });
-      groupYMap.set('rotation', 0);
-      groupYMap.set('children', childrenArray);
-
-      this.objects.insert(0, [groupYMap]);
-
-      newGroup = yMapToObject(groupYMap) as GroupInterface;
+      ok = true;
     });
 
-    return newGroup;
+    return ok ? (this.snapshot.find(o => o.id === groupId) as GroupInterface) : undefined;
   }
 
   /**
-   * Ungroup matching groups, inserting their children at the
-   * group's position in the top-level array. Returns the ungrouped
-   * children, or undefined if no groups were ungrouped.
+   * Ungroup. Children are reparented, not rebuilt, so concurrent edits to them
+   * survive.
    */
   ungroup(ids: string[]): GraphicObjectInterface[] | undefined {
     if (ids.length === 0) return undefined;
-    const idSet = new Set(ids);
     const released: GraphicObjectInterface[] = [];
 
     this.doc.transact(() => {
-      for (let i = this.objects.length - 1; i >= 0; i--) {
-        const obj = this.objects.get(i);
-        if (
-          idSet.has(obj.get('id') as string) &&
-          obj.get('type') === 'group'
-        ) {
-          const children = obj.get('children') as Y.Array<Y.Map<unknown>>;
-          if (children) {
-            // Convert to plain, then back to fresh Y.Maps (safer than clone)
-            const plainChildren: GraphicObjectInterface[] = [];
-            for (let j = 0; j < children.length; j++) {
-              plainChildren.push(yMapToObject(children.get(j)));
-            }
-            released.unshift(...plainChildren);
-            this.objects.delete(i, 1);
-            this.objects.insert(i, plainChildren.map(c => objectToYMap(c)));
-          }
+      const rows = this.rows();
+      const groups = rows.filter(r => ids.includes(r.id) && r.map.get('type') === 'group');
+
+      for (const g of groups) {
+        const kids = this.siblings(rows, g.id);
+        let prev: string | null = g.order;
+        for (const kid of kids) {
+          // Slot the children in where the group used to sit.
+          prev = generateKeyBetween(prev, null);
+          kid.map.set(PARENT, g.parentId);
+          kid.map.set(ORDER, prev);
+          released.push(rowToObject(kid.map) as unknown as GraphicObjectInterface);
         }
+        this.deleteRows(new Set([g.id]));
       }
     });
 
     return released.length > 0 ? released : undefined;
   }
 
-  /** Move an object to a different index in the top-level array. */
+  /**
+   * Move an object to a different index among its siblings.
+   * One `set()` on the order field: concurrent reorders resolve last-writer-wins
+   * on that key instead of duplicating the shape.
+   */
   reorder(id: string, targetIdx: number): void {
     this.doc.transact(() => {
-      for (let i = 0; i < this.objects.length; i++) {
-        if (this.objects.get(i).get('id') === id) {
-          const plain = yMapToObject(this.objects.get(i));
-          this.objects.delete(i, 1);
-          const clampedIdx = Math.min(targetIdx, this.objects.length);
-          this.objects.insert(clampedIdx, [objectToYMap(plain)]);
-          return;
-        }
-      }
+      const rows = this.rows();
+      const row = rows.find(r => r.id === id);
+      if (!row) return;
+
+      const sibs = this.siblings(rows, row.parentId).filter(r => r.id !== id);
+      const clamped = Math.max(0, Math.min(targetIdx, sibs.length));
+      const before = clamped === 0 ? null : sibs[clamped - 1].order;
+      const after = clamped >= sibs.length ? null : sibs[clamped].order;
+      row.map.set(ORDER, generateKeyBetween(before, after));
     });
   }
 
-  /**
-   * Find the top-level or containing-group root for a given id.
-   * Returns the selectable root object, or undefined if not found.
-   */
+  /** The outermost ancestor of an id — what a click should select. */
   findSelectable(id: string): GraphicObjectInterface | undefined {
-    for (const obj of this.snapshot) {
-      const found = searchInSnapshot(id, obj);
-      if (found) return found;
-    }
-    return undefined;
+    const rows = this.rows();
+    const root = this.rootOf(rows, id);
+    if (!root) return undefined;
+    return this.snapshot.find(o => o.id === root.id);
   }
 
   /** Subscribe to any change in the document. Returns an unsubscribe fn. */
@@ -314,40 +347,41 @@ export class YjsGraphicModel {
   }
 
   /**
-   * Register a callback for local-only yjs updates (binary diffs).
-   * Remote updates (via applyRemoteUpdate) are filtered out.
-   * Returns an unsubscribe function.
+   * Register a callback for local-only updates. Updates applied via
+   * applyRemoteUpdate are filtered out so they are never echoed back.
    */
   onLocalUpdate(callback: (update: Uint8Array) => void): () => void {
     const handler = (update: Uint8Array, origin: unknown) => {
-      if (origin !== this) callback(update);
+      if (origin !== REMOTE_ORIGIN && origin !== this) callback(update);
     };
     this.doc.on('update', handler);
     return () => this.doc.off('update', handler);
   }
 
-  /** Load a plain-array snapshot into the document (replaces everything). */
+  /** Replace the whole document with a plain-array snapshot. */
   restore(objects: GraphicObjectInterface[]): void {
     this.doc.transact(() => {
       this.objects.delete(0, this.objects.length);
-      this.objects.push(
-        objects.map((obj) => objectToYMap(obj))
-      );
+      const flatten = (list: GraphicObjectInterface[], parentId: string | null) => {
+        let prev: string | null = null;
+        for (const obj of list) {
+          prev = generateKeyBetween(prev, null);
+          this.objects.push([
+            objectToYMap(obj as unknown as Record<string, unknown>, parentId, prev),
+          ]);
+          if (obj.type === 'group') flatten((obj as GroupInterface).children, obj.id);
+        }
+      };
+      flatten(objects, null);
     });
   }
 
-  /**
-   * Apply a yjs update (binary) from a remote peer.
-   * This is the primary path for collaboration sync.
-   */
+  /** Apply a Yjs update from a peer or from storage. */
   applyRemoteUpdate(update: Uint8Array): void {
-    Y.applyUpdate(this.doc, update, this);
+    Y.applyUpdate(this.doc, update, REMOTE_ORIGIN);
   }
 
-  /**
-   * Encode the full document state as a yjs update binary.
-   * Sent to peers on initial sync or to the backend for persistence.
-   */
+  /** Full document state as a Yjs update. */
   encodeStateAsUpdate(): Uint8Array {
     return Y.encodeStateAsUpdate(this.doc);
   }

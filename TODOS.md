@@ -3,40 +3,6 @@
 Deferred scope from the /autoplan review (2026-09-02, branch `dev`).
 Blocking Phase 2 work lives in PLAN.md, not here.
 
-## Model
-
-### Fix CRDT-unsafe reorder / group / ungroup
-
-**What:** Replace delete-and-rebuild with stable CRDT identity: ordering as a
-fractional-index `order` field, group membership as a `parentId` field.
-
-**Why:** Verified on yjs 13.6.31 — two concurrent reorders produce a duplicated
-shape id on both peers, and a concurrent property edit is silently discarded.
-Both converge, so a snapshot-equality test passes on the corrupt document.
-
-**Context:** `YjsGraphicModel.ts:210-245` (`group`), `:252-280` (`ungroup`),
-`:283-295` (`reorder`). This is why PLAN.md Phase 1 is marked REOPENED. It
-blocks every other Phase 2 task; tracked in PLAN.md as decision #16.
-
-**Effort:** L
-**Priority:** P0
-**Depends on:** None
-
-### move/update/remove traversal asymmetry
-
-**What:** `move()` recurses into group children via `yWalk`; `update()` and
-`remove()` scan top level only.
-
-**Why:** Inconsistent undo and edit granularity for grouped shapes.
-
-**Context:** Currently unreachable from the UI — `Shape/index.tsx` routes clicks
-through `findSelectable`, which returns the containing group, so selection can
-never hold a child id. Becomes reachable if selection semantics change.
-
-**Effort:** S
-**Priority:** P3
-**Depends on:** None
-
 ## Backend
 
 ### Add @RestControllerAdvice so missing documents return 404
@@ -53,6 +19,23 @@ Spring error JSON into the status bar.
 and `DocumentIntegrationTest.fullCrudLifecycle`. ~15 lines fixes all four.
 
 **Effort:** S
+**Priority:** P1
+**Depends on:** None
+
+### Migrate or reject documents stored in the pre-v0.2.0.0 encoding
+
+**What:** Detect a stored Yjs update that uses the old nested-`children`
+encoding and either flatten it or refuse to load it with a clear message.
+
+**Why:** v0.2.0.0 changed the document encoding. An old document loads with its
+groups empty — children silently vanish.
+
+**Context:** Harmless today because `jdbc:h2:mem:` wipes on restart and the
+legacy JSON path still flattens correctly. Becomes a real migration the moment
+persistence moves to disk, which is itself a P1 elsewhere in this file. Do this
+BEFORE switching H2 to file mode.
+
+**Effort:** M
 **Priority:** P1
 **Depends on:** None
 
@@ -169,6 +152,20 @@ works at all right now.
 **Depends on:** None
 
 ## Completed
+
+### Fix CRDT-unsafe reorder / group / ungroup
+The three methods deleted a shape's `Y.Map` and rebuilt it, which duplicated
+ids and discarded concurrent property edits. Ordering is now a fractional-index
+`order` field and grouping a `parentId` field, so a move is a single `set()`.
+`snapshot` rebuilds the nested tree, so no view or type changed.
+Guarded by `CrdtSafety.test.ts`, 4 of whose 5 tests failed before the fix.
+**Completed:** v0.2.0.0 (2026-09-03)
+
+### move/update/remove traversal asymmetry
+`move` recursed into group children while `update` and `remove` scanned only the
+top level. The flat encoding removes the distinction: all three operate on the
+same flat row set.
+**Completed:** v0.2.0.0 (2026-09-03)
 
 ### Relay binary WebSocket frames instead of rejecting them
 `CollaborationHandler` extended `TextWebSocketHandler`, which closed the session
