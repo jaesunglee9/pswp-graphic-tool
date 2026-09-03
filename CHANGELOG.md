@@ -2,11 +2,66 @@
 
 All notable changes to this project are documented here.
 
+## [0.2.0.0] - 2026-09-03
+
+Fixes the data-corruption bug that v0.1.0.0 made reachable. Two peers can now
+edit the same document concurrently without duplicating or losing shapes.
+
+### Fixed
+- **`reorder` / `group` / `ungroup` are CRDT-safe.** They used to delete a
+  shape's `Y.Map` and rebuild it, which is not a move. Verified on
+  yjs 13.6.31, before this change:
+
+  ```
+  two peers reorder the same shape  -> the id appears TWICE, on both peers
+  recolor concurrent with a reorder -> the recolor is silently discarded
+  ```
+
+  Both peers converged, so a snapshot-equality test passed on the corruption.
+  Moving a shape is now a single `set()` on a field, so concurrent edits to
+  other fields on the same shape survive and no clone is ever created.
+- **`update` and `remove` now reach shapes inside groups.** They previously
+  scanned only the top level while `move` recursed, so the three disagreed
+  about what "selected" meant. The flat encoding removes the asymmetry.
+
+### Changed
+- **BREAKING: the document encoding changed.** Shapes are stored as one flat
+  `Y.Array` with two structural fields — `order` (fractional index, via
+  `fractional-indexing`) and `parentId` — instead of groups nesting their
+  children in another `Y.Array`. Yjs arrays have no move operation, which is
+  why the old encoding had to clone.
+
+  A document saved in the old encoding will load with its groups empty. Nothing
+  is at risk today because H2 is in-memory and wipes on restart, and the legacy
+  JSON path still flattens correctly. If persistence moves to disk before this
+  is addressed, that becomes a real migration.
+
+  `snapshot` still returns the same nested tree, so views, utils and
+  `GraphicObjectInterface` are untouched.
+- `applyRemoteUpdate` now tags updates with an exported `REMOTE_ORIGIN` symbol
+  so `onLocalUpdate` filters them deterministically instead of relying on the
+  model instance identity.
+
+### Added
+- `CrdtSafety.test.ts` — 5 tests asserting invariants rather than convergence:
+  no duplicate ids at any depth, property edits surviving concurrent structural
+  edits, and every id reachable after a concurrent reorder + group. Four of them
+  failed before this change.
+- `fractional-indexing@4` — ordering keys between siblings. Not hand-rolled; a
+  correct implementation is not a few lines.
+
+### Known Broken
+Unchanged from v0.1.0.0: no server-side document state (initial sync needs a
+live peer), the connection indicator can read "Live" after a disconnect, undo is
+snapshot-based and replicates as delete-and-recreate, and 4 of 22 backend tests
+fail on a missing `@RestControllerAdvice`.
+
 ## [0.1.0.0] - 2026-09-02
 
 First versioned release. Establishes the collaborative architecture.
 **Live multi-client editing works**; persistence to an empty room and several
-correctness gaps do not — see Known Broken below.
+correctness gaps do not — see Known Broken below. (The CRDT-safety gap listed
+here was fixed in v0.2.0.0.)
 
 ### Added
 - **Spring Boot backend** (`backend/`): document CRUD over REST, H2 storage,
