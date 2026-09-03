@@ -148,9 +148,45 @@ hook fires `updatePosition` on every raw `mousemove`.
 **Priority:** P3
 **Depends on:** None
 
+## Backend (continued)
+
+### Server-side document state so an empty room can serve a joiner
+
+**What:** Keep a per-room append-only Yjs update log plus a compacted snapshot,
+and replay it to every joiner.
+
+**Why:** The server is a pure relay today, so initial sync only works when a
+live peer is present. Open a document alone and you get whatever was last
+saved; nothing was saved, blank canvas.
+
+**Context:** This is the Stage 1 design in
+docs/designs/yjs-binary-sync-stateful-room.md. The peer handshake (envelope 2)
+shipped in v0.1.0.0 covers the live-peer case and is the reason collaboration
+works at all right now.
+
+**Effort:** L
+**Priority:** P1
+**Depends on:** None
+
 ## Completed
 
-_None yet._
+### Relay binary WebSocket frames instead of rejecting them
+`CollaborationHandler` extended `TextWebSocketHandler`, which closed the session
+with 1003 on the first edit. Now extends `BinaryWebSocketHandler`, wraps
+sessions in `ConcurrentWebSocketSessionDecorator`, keys the room by session id,
+and removes rooms atomically via `compute()`.
+**Completed:** v0.1.0.0 (2026-09-03)
+
+### Stop seeding clients from a JSON snapshot
+Each client built its own `Y.Map` objects from the JSON, so replicas shared no
+CRDT identity and merging duplicated every shape. Persistence is now the
+base64-encoded Yjs update, which is idempotent on replay.
+**Completed:** v0.1.0.0 (2026-09-03)
+
+### Two-leg peer handshake for initial sync
+Clients send full state on every connect and ask peers for theirs (envelope 2).
+Late joiners now receive existing content from a live peer.
+**Completed:** v0.1.0.0 (2026-09-03)
 
 <!-- Documentation reconciliation (README / ARCHITECTURE.md / JSDoc vs the design
      doc) was moved OUT of this file and INTO PLAN.md as a Phase 2 exit criterion
